@@ -22,9 +22,57 @@ def test_workspace_roundtrip(tmp_path: Path, monkeypatch, capsys):
     assert status["sources"] == 1
     assert status["claims"] == 1
     assert status["evidence_links"] == 1
+    assert status["claim_relations"] == 0
+    assert status["probes"] == 0
     assert status["unlinked_claims"] == 0
     snapshot = json.loads((workspace / "atlas.json").read_text())
+    assert snapshot["format"] == "corpus-atlas/0.2"
     assert snapshot["evidence_links"][0]["source_id"] == source
+
+
+def test_discovery_hypotheses_and_probes(tmp_path: Path, monkeypatch, capsys):
+    workspace = tmp_path / "discovery"
+    run(monkeypatch, capsys, "init", workspace, "--title", "Mechanism discovery",
+        "--question", "Which observation discriminates the competing mechanisms?", "--domain", "science")
+
+    static = run(monkeypatch, capsys, "claim", "add", workspace,
+        "--text", "The nominal static surface is sufficient to explain the measured selectivity",
+        "--kind", "hypothesis")
+    dynamic = run(monkeypatch, capsys, "claim", "add", workspace,
+        "--text", "A condition-induced reconstructed active-state ensemble controls selectivity",
+        "--kind", "hypothesis")
+    relation = run(monkeypatch, capsys, "claim", "relate", workspace,
+        "--from", dynamic, "--to", static, "--relation", "competes-with",
+        "--rationale", "They assign selectivity to different catalyst states")
+
+    probe = run(monkeypatch, capsys, "probe", "add", workspace,
+        "--title", "Finite-temperature active-state search",
+        "--target-claim", dynamic, "--modality", "MLIP-MD",
+        "--question", "Does a recurrent reconstructed state appear only under reactive coverage?",
+        "--if-true", "A recurrent state basin appears and survives DFT re-evaluation",
+        "--if-false", "Trajectories remain in the static-state basin",
+        "--cost", "medium", "--priority", "0.9")
+
+    planned = json.loads(run(monkeypatch, capsys, "probe", "list", workspace, "--status", "planned"))
+    assert planned[0]["id"] == probe
+    assert planned[0]["target_claim_id"] == dynamic
+
+    observation = run(monkeypatch, capsys, "claim", "add", workspace,
+        "--text", "Reactive-coverage trajectories repeatedly visit a reconstructed state basin",
+        "--kind", "observed")
+    result = run(monkeypatch, capsys, "probe", "result", workspace,
+        "--probe", probe, "--observation-claim", observation,
+        "--verdict", "supports", "--summary", "Candidate state requires DFT adjudication")
+
+    status = json.loads(run(monkeypatch, capsys, "status", workspace))
+    assert status["claim_relations"] == 1
+    assert status["probes"] == 1
+    assert status["probe_results"] == 1
+    assert status["open_probes"] == 0
+    snapshot = json.loads((workspace / "atlas.json").read_text())
+    assert snapshot["claim_relations"][0]["id"] == relation
+    assert snapshot["probe_results"][0]["id"] == result
+    assert snapshot["probes"][0]["status"] == "completed"
 
 
 def test_scholarly_import_search_and_bibtex(tmp_path: Path, monkeypatch, capsys):
