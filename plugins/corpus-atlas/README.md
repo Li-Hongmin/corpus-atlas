@@ -40,6 +40,25 @@ Each investigation contains `atlas.sqlite3`, a human-readable `atlas.json`, and 
 `attachments/` directory. Exported JSON is portable; attachments remain local unless deliberately
 shared.
 
+### Scholarly library
+
+```bash
+corpus-atlas paper discover investigations/example \
+  --query "causal inference under distribution shift" --provider openalex --cache
+corpus-atlas paper import investigations/example --from literature-matrix.csv
+corpus-atlas paper search investigations/example "distribution shift"
+corpus-atlas paper retrieve investigations/example --paper smith2026causal \
+  --url 'https://repository.example/paper.pdf' --source 'Institutional repository' \
+  --license 'CC-BY-4.0' --role main
+corpus-atlas paper dedupe investigations/example
+corpus-atlas paper export-bib investigations/example --output corpus.bib
+```
+
+Paper records retain DOI, arXiv, PMID, Semantic Scholar and OpenAlex identifiers, abstracts,
+backward references, forward citations, reading status, full-text status, and separately recorded
+main-text and supplementary attachments. A paper belongs to the corpus when its record is admitted;
+a PDF is optional.
+
 ## Codex plugin
 
 The bundled `build-research-corpus` skill guides an agent through decision-focused acquisition,
