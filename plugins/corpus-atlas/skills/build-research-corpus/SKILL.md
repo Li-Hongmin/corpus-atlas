@@ -1,6 +1,6 @@
 ---
 name: build-research-corpus
-description: Build and maintain a local, traceable investigation corpus from web pages, documents, datasets, scholarly papers, company filings, government records, policy materials, and news. Use for scientific literature research, financial or company analysis, public-policy and social-issue investigations, event timelines, source verification, competing-hypothesis analysis, claim-evidence mapping, and any task where searches and retrieved materials should remain reusable in a local workspace. Do not use for casual questions that do not benefit from persistent sources or for unsupported automatic truth judgments.
+description: Build and maintain a local, traceable investigation corpus from web pages, documents, datasets, scholarly papers, company filings, government records, policy materials, and news. Includes scholarly discovery through OpenAlex or Crossref, bibliographic and citation caching, local paper search, legal full-text and supplement retrieval, duplicate previews, and BibTeX export. Use for scientific literature research, financial or company analysis, public-policy and social-issue investigations, event timelines, source verification, competing-hypothesis analysis, claim-evidence mapping, and any task where searches and retrieved materials should remain reusable in a local workspace. Do not use for casual questions that do not benefit from persistent sources or for unsupported automatic truth judgments.
 ---
 
 # Build Research Corpus
@@ -30,6 +30,48 @@ corpus-atlas init /absolute/path/to/investigation --title "Investigation title" 
 
 Use `science`, `finance`, or `public-affairs` instead of `general` when one source regime dominates.
 Read the matching file in `references/` before collecting domain-specific evidence.
+
+## Build A Scholarly Corpus
+
+For scientific work, use Corpus Atlas as the library rather than treating papers as generic URLs.
+Discover current records through OpenAlex or Crossref and cache admitted results:
+
+```bash
+corpus-atlas paper discover WORKSPACE --query "research question" \
+  --provider openalex --limit 25 --cache
+```
+
+Import a JSON, CSV, or TSV research matrix when a connector or prior search provides richer fields:
+
+```bash
+corpus-atlas paper import WORKSPACE --from /absolute/path/to/records.json
+```
+
+Records may include `title`, `authors`, `year`, `doi`, `arxiv`, `pmid`, `semantic_scholar_id`,
+`openalex_id`, `abstract`, `references`, `citations`, `url`, `venue`, `publisher`, `search_date`,
+`reading_status`, and `fulltext_status`. Cache metadata and citation relations even when no full text
+is legally available.
+
+Retrieve only a verified lawful main text or supplement, always recording its source and license:
+
+```bash
+corpus-atlas paper retrieve WORKSPACE --paper CITATION_KEY \
+  --url 'https://repository.example/paper.pdf' --source 'Repository name' \
+  --license 'CC-BY-4.0' --role main
+```
+
+Use `--role supplement` for datasets, spreadsheets, archives, and other supplementary files. Never
+bypass authentication, CAPTCHA, access controls, or paywalls. Search the local corpus and export it:
+
+```bash
+corpus-atlas paper search WORKSPACE 'title, author, abstract, or DOI query'
+corpus-atlas paper dedupe WORKSPACE
+corpus-atlas paper export-bib WORKSPACE --output corpus.bib
+```
+
+`paper dedupe` is a non-destructive preview. Prefer DOI, arXiv, or PMID identity; use normalized title
+and year only as a candidate signal. Read `references/science.md` for the retrieval ladder and
+evidence-level rules.
 
 ## Acquire Sources
 

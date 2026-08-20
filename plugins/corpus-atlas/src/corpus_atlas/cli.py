@@ -10,6 +10,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .scholarly import (
+    add_scholarly_parsers,
+    dispatch_scholarly,
+    scholarly_snapshot,
+)
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -31,6 +37,27 @@ CREATE TABLE IF NOT EXISTS evidence_links (
     id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(id),
     claim_id TEXT NOT NULL REFERENCES claims(id), relation TEXT NOT NULL,
     locator TEXT, quote TEXT, limitations TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS papers (
+    id TEXT PRIMARY KEY, citation_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+    authors TEXT, year INTEGER, doi TEXT UNIQUE, arxiv TEXT UNIQUE, pmid TEXT UNIQUE,
+    semantic_scholar_id TEXT, openalex_id TEXT, venue TEXT, publisher TEXT,
+    abstract TEXT, url TEXT, metadata_source TEXT, search_date TEXT,
+    reading_status TEXT NOT NULL DEFAULT 'metadata-only',
+    fulltext_status TEXT NOT NULL DEFAULT 'metadata-only', created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_relations (
+    id TEXT PRIMARY KEY, paper_id TEXT NOT NULL REFERENCES papers(id),
+    direction TEXT NOT NULL, related_identifier TEXT NOT NULL,
+    relation_data TEXT, UNIQUE(paper_id, direction, related_identifier)
+);
+CREATE TABLE IF NOT EXISTS paper_files (
+    id TEXT PRIMARY KEY, paper_id TEXT NOT NULL REFERENCES papers(id),
+    role TEXT NOT NULL, local_file TEXT NOT NULL, source_url TEXT NOT NULL,
+    source_name TEXT, license TEXT NOT NULL, original_filename TEXT,
+    content_type TEXT, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL,
+    retrieved_at TEXT NOT NULL, UNIQUE(paper_id, role, sha256)
 );
 """
 
@@ -54,7 +81,7 @@ def workspace(path: str, must_exist: bool = True) -> tuple[Path, Path]:
 def connect(database: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript(SCHEMA)
     return connection
 
 
@@ -66,6 +93,7 @@ def write_snapshot(root: Path, connection: sqlite3.Connection) -> None:
         "sources": [dict(row) for row in connection.execute("SELECT * FROM sources ORDER BY created_at, id")],
         "claims": [dict(row) for row in connection.execute("SELECT * FROM claims ORDER BY created_at, id")],
         "evidence_links": [dict(row) for row in connection.execute("SELECT * FROM evidence_links ORDER BY created_at, id")],
+        **scholarly_snapshot(connection),
     }
     (root / "atlas.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -162,8 +190,14 @@ def command_status(args: argparse.Namespace) -> None:
         unlinked = connection.execute(
             "SELECT COUNT(*) FROM claims c WHERE NOT EXISTS (SELECT 1 FROM evidence_links e WHERE e.claim_id=c.id)"
         ).fetchone()[0]
+        scholarly_counts = {
+            "papers": connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0],
+            "paper_relations": connection.execute("SELECT COUNT(*) FROM paper_relations").fetchone()[0],
+            "paper_files": connection.execute("SELECT COUNT(*) FROM paper_files").fetchone()[0],
+        }
     print(json.dumps({"title": inv["title"], "question": inv["question"],
                       "domain": inv["domain"], **counts,
+                      **scholarly_counts,
                       "unresolved_claims": unresolved, "unlinked_claims": unlinked},
                      ensure_ascii=False, indent=2))
 
@@ -234,13 +268,17 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("path")
     export.add_argument("--output")
     export.set_defaults(run=command_export)
+    add_scholarly_parsers(commands)
     return root
 
 
 def main() -> None:
     try:
         args = parser().parse_args()
-        args.run(args)
+        if hasattr(args, "run"):
+            args.run(args)
+        else:
+            dispatch_scholarly(args, workspace, connect, write_snapshot)
     except BrokenPipeError:
         sys.exit(0)
 
