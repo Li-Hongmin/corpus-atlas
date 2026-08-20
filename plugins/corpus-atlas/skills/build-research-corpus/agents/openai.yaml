@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Research Corpus"
+  short_description: "Build a local, traceable corpus for rigorous investigations"
+  default_prompt: "Use $build-research-corpus to investigate this question and preserve the sources, claims, and evidence locally."

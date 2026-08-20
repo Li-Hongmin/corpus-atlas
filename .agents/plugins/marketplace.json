@@ -1,0 +1,20 @@
+{
+  "name": "corpus-atlas",
+  "interface": {
+    "displayName": "Corpus Atlas"
+  },
+  "plugins": [
+    {
+      "name": "corpus-atlas",
+      "source": {
+        "source": "local",
+        "path": "./plugins/corpus-atlas"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

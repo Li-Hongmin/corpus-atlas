@@ -1,0 +1,28 @@
+{
+  "name": "corpus-atlas",
+  "version": "0.1.0",
+  "description": "Build local, traceable research corpora for scientific, financial, policy, and news investigations.",
+  "author": {
+    "name": "Li Hongmin",
+    "url": "https://github.com/Li-Hongmin"
+  },
+  "homepage": "https://github.com/Li-Hongmin/corpus-atlas",
+  "repository": "https://github.com/Li-Hongmin/corpus-atlas",
+  "license": "MIT",
+  "keywords": ["research", "investigation", "provenance", "local-first", "evidence"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Corpus Atlas",
+    "shortDescription": "Local, traceable workspaces for rigorous investigations.",
+    "longDescription": "Turn searches into durable local corpora with source provenance, atomic claims, evidence relationships, and explicit uncertainty across science, finance, policy, and news.",
+    "developerName": "Li Hongmin",
+    "category": "Productivity",
+    "capabilities": ["Research", "Local workspace", "Evidence mapping"],
+    "websiteURL": "https://github.com/Li-Hongmin/corpus-atlas",
+    "defaultPrompt": [
+      "Build a local evidence corpus for this question.",
+      "Map what supports and contradicts this claim.",
+      "Investigate this event with a source timeline."
+    ]
+  }
+}
