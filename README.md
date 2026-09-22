@@ -14,8 +14,7 @@ codex plugin marketplace add Li-Hongmin/corpus-atlas
 
 Then install **Corpus Atlas** from the Plugins Directory.
 
-The repository has not yet been published at the URL above; the command becomes active after the
-maintainer creates and pushes the public GitHub repository.
+The repository is public at [Li-Hongmin/corpus-atlas](https://github.com/Li-Hongmin/corpus-atlas).
 
 ## Develop
 
