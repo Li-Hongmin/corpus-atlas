@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-USER_AGENT = "CorpusAtlas/0.2 (+https://github.com/Li-Hongmin/corpus-atlas)"
+USER_AGENT = "Mozilla/5.0 (compatible; CorpusAtlas/0.3; +https://github.com/Li-Hongmin/corpus-atlas)"
 
 
 def current_time() -> str:
@@ -174,13 +174,16 @@ def openalex_abstract(index: Any) -> str | None:
 
 def discover(query: str, provider: str, limit: int) -> list[dict[str, Any]]:
     encoded = urllib.parse.quote(query)
+    if provider == "semanticscholar":
+        from .fulltext import semantic_scholar_search
+        return semantic_scholar_search(query, limit)
     if provider == "openalex":
         data = request_json(f"https://api.openalex.org/works?search={encoded}&per-page={limit}")
         rows = []
         for work in data.get("results", []):
             rows.append({"title": work.get("title"), "authors": [a.get("author", {}).get("display_name") for a in work.get("authorships", [])],
                          "year": work.get("publication_year"), "doi": work.get("doi"), "openalex_id": work.get("id"),
-                         "venue": (work.get("primary_location") or {}).get("source", {}).get("display_name"),
+                         "venue": ((work.get("primary_location") or {}).get("source") or {}).get("display_name"),
                          "url": (work.get("primary_location") or {}).get("landing_page_url"),
                          "abstract": openalex_abstract(work.get("abstract_inverted_index")),
                          "references": work.get("referenced_works", []), "metadata_source": "OpenAlex"})
@@ -195,17 +198,6 @@ def discover(query: str, provider: str, limit: int) -> list[dict[str, Any]]:
                      "url": work.get("URL"), "abstract": work.get("abstract"),
                      "references": work.get("reference", []), "metadata_source": "Crossref"})
     return rows
-
-
-def download_file(url: str, destination: Path) -> tuple[str, int, str]:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    digest = hashlib.sha256()
-    size = 0
-    with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
-        content_type = response.headers.get_content_type()
-        while block := response.read(1024 * 1024):
-            output.write(block); digest.update(block); size += len(block)
-    return digest.hexdigest(), size, content_type
 
 
 def bib_escape(value: Any) -> str:
@@ -223,9 +215,16 @@ def scholarly_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
 def add_scholarly_parsers(commands: argparse._SubParsersAction) -> None:
     paper = commands.add_parser("paper", help="discover, cache, retrieve, and export scholarly records").add_subparsers(dest="paper_command", required=True)
     imp = paper.add_parser("import"); imp.add_argument("path"); imp.add_argument("--from", dest="input", required=True)
-    discover_p = paper.add_parser("discover"); discover_p.add_argument("path"); discover_p.add_argument("--query", required=True); discover_p.add_argument("--provider", choices=("openalex", "crossref"), default="openalex"); discover_p.add_argument("--limit", type=int, default=10); discover_p.add_argument("--cache", action="store_true")
+    discover_p = paper.add_parser("discover"); discover_p.add_argument("path"); discover_p.add_argument("--query", required=True); discover_p.add_argument("--provider", choices=("openalex", "crossref", "semanticscholar"), default="openalex"); discover_p.add_argument("--limit", type=int, default=10); discover_p.add_argument("--cache", action="store_true")
     search = paper.add_parser("search"); search.add_argument("path"); search.add_argument("query")
     retrieve = paper.add_parser("retrieve"); retrieve.add_argument("path"); retrieve.add_argument("--paper", required=True); retrieve.add_argument("--url", required=True); retrieve.add_argument("--license", required=True); retrieve.add_argument("--source", required=True); retrieve.add_argument("--role", choices=("main", "supplement"), default="main"); retrieve.add_argument("--filename")
+    retrieve.add_argument("--no-fallback", action="store_true", help="do not try alternative OA locations when the URL fails"); retrieve.add_argument("--email")
+    batch = paper.add_parser("retrieve-all", help="resolve and download legal OA full texts for all cached papers"); batch.add_argument("path"); batch.add_argument("--email", help="contact email for Unpaywall/OpenAlex (or CORPUS_ATLAS_EMAIL)"); batch.add_argument("--max-workers", type=int, default=4); batch.add_argument("--limit", type=int); batch.add_argument("--skip-failed", action="store_true", help="do not retry papers that failed before")
+    resolve = paper.add_parser("resolve", help="list legal OA candidates for one paper"); resolve.add_argument("path"); resolve.add_argument("--paper", required=True); resolve.add_argument("--email")
+    supp = paper.add_parser("supplements", help="discover/backfill repository supplementary files (preview by default)"); supp.add_argument("path"); supp.add_argument("--paper"); supp.add_argument("--email"); supp.add_argument("--apply", action="store_true")
+    pubs = paper.add_parser("publications", help="check preprints for published versions (preview by default)"); pubs.add_argument("path"); pubs.add_argument("--email"); pubs.add_argument("--apply", action="store_true")
+    chk = paper.add_parser("check", help="verify attachments by sha256; optional restore preview"); chk.add_argument("path"); chk.add_argument("--restore-from"); chk.add_argument("--apply", action="store_true")
+    cites = paper.add_parser("citations", help="cache forward citations of a paper"); cites.add_argument("path"); cites.add_argument("--paper", required=True); cites.add_argument("--provider", choices=("openalex", "semanticscholar"), default="openalex"); cites.add_argument("--limit", type=int, default=25); cites.add_argument("--cache", action="store_true"); cites.add_argument("--email")
     dedupe = paper.add_parser("dedupe"); dedupe.add_argument("path")
     bib = paper.add_parser("export-bib"); bib.add_argument("path"); bib.add_argument("--output", required=True)
 
@@ -252,18 +251,51 @@ def dispatch_scholarly(args: argparse.Namespace, workspace: Callable, connect: C
             term = f"%{args.query}%"
             rows = [dict(row) for row in connection.execute("SELECT * FROM papers WHERE title LIKE ? OR authors LIKE ? OR abstract LIKE ? OR doi LIKE ? ORDER BY year DESC", (term,term,term,term))]
             print(json.dumps(rows, ensure_ascii=False, indent=2)); return
+        from . import fulltext as ft
+        email = ft.resolve_email(getattr(args, "email", None))
+        def find_paper(ref: str) -> sqlite3.Row:
+            row = connection.execute("SELECT * FROM papers WHERE id=? OR citation_key=? OR doi=?", (ref, ref, normalize_doi(ref))).fetchone()
+            if not row: raise SystemExit(f"Unknown paper: {ref}")
+            return row
+        def emit(value: Any) -> None: print(json.dumps(value, ensure_ascii=False, indent=2))
         if args.paper_command == "retrieve":
-            paper_row = connection.execute("SELECT * FROM papers WHERE id=? OR citation_key=?", (args.paper,args.paper)).fetchone()
-            if not paper_row: raise SystemExit(f"Unknown paper: {args.paper}")
-            name = args.filename or Path(urllib.parse.urlparse(args.url).path).name or f"{paper_row['citation_key']}.pdf"
-            destination = root / "attachments" / f"{paper_row['citation_key']}-{args.role}-{name}"
-            try: digest, size, content_type = download_file(args.url, destination)
-            except (urllib.error.URLError, TimeoutError) as error: destination.unlink(missing_ok=True); raise SystemExit(f"Download failed: {error}") from error
-            if args.role == "main" and destination.read_bytes()[:5] != b"%PDF-": destination.unlink(missing_ok=True); raise SystemExit("Main-text download is not a PDF")
-            connection.execute("INSERT OR IGNORE INTO paper_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                               (f"fil_{uuid.uuid4().hex[:12]}", paper_row["id"], args.role, str(destination.relative_to(root)), args.url, args.source, args.license, name, content_type, digest, size, current_time()))
-            if args.role == "main": connection.execute("UPDATE papers SET fulltext_status='local-fulltext',updated_at=? WHERE id=?", (current_time(),paper_row["id"]))
-            write_snapshot(root, connection); print(json.dumps({"file": str(destination), "sha256": digest, "bytes": size}, indent=2)); return
+            paper_row = find_paper(args.paper)
+            response = ft.http_get(args.url, ft.PDF_ACCEPT, email, timeout=90)
+            ok = response.status == 200 and (args.role != "main" or response.body.startswith(b"%PDF-"))
+            candidate = {"url": args.url, "source": args.source, "license": args.license}
+            attempts = [] if ok else [{"url": args.url, "source": args.source, "reason": response.error or ("not a PDF" if response.status == 200 else f"HTTP {response.status}")}]
+            if not ok and args.role == "main" and not args.no_fallback:
+                outcome = ft.fetch_fulltext(dict(paper_row), email); attempts += outcome["attempts"]
+                if outcome["status"] == "downloaded":
+                    ok, candidate = True, outcome["candidate"]
+                    response = ft.Response(200, outcome["content_type"], outcome["body"], candidate["url"])
+            if not ok:
+                raise SystemExit("Download failed; no legal alternative succeeded:\n" + "\n".join(f"  - {a['url']}: {a['reason']}" for a in attempts))
+            stored = ft.store_file(connection, root, paper_row, args.role, response.body, candidate["url"], candidate["source"], candidate["license"], response.content_type, args.filename or "")
+            write_snapshot(root, connection); emit({**stored, "file": str(root / stored["file"]), "source": candidate["source"], "fallback_attempts": attempts}); return
+        if args.paper_command == "retrieve-all":
+            summary = ft.retrieve_all(connection, root, email, args.max_workers, args.limit, not args.skip_failed)
+            write_snapshot(root, connection); emit(summary); return
+        if args.paper_command == "resolve":
+            emit(ft.resolve_candidates(dict(find_paper(args.paper)), email)); return
+        if args.paper_command == "supplements":
+            report = ft.supplements(connection, root, email, args.apply, args.paper)
+            if args.apply: write_snapshot(root, connection)
+            emit(report); return
+        if args.paper_command == "publications":
+            report = ft.publications(connection, email, args.apply)
+            if args.apply: write_snapshot(root, connection)
+            emit(report); return
+        if args.paper_command == "check":
+            emit(ft.check(connection, root, Path(args.restore_from).expanduser().resolve() if args.restore_from else None, args.apply)); return
+        if args.paper_command == "citations":
+            paper_row = find_paper(args.paper)
+            rows = ft.forward_citations(dict(paper_row), args.provider, max(1, min(args.limit, 100)), email)
+            for row in rows:
+                identifier = f"doi:{normalize_doi(row['doi'])}" if row.get("doi") else stable_identifier(row)
+                connection.execute("INSERT OR IGNORE INTO paper_relations VALUES (?,?,?,?,?)", (f"rel_{uuid.uuid4().hex[:12]}", paper_row["id"], "citations", identifier, json.dumps(row, ensure_ascii=False)))
+                if args.cache and row.get("title"): cache_record(connection, row)
+            write_snapshot(root, connection); emit(rows); return
         if args.paper_command == "dedupe":
             rows = list(connection.execute("SELECT id,citation_key,title,year,doi,arxiv FROM papers ORDER BY citation_key")); groups: dict[str,list[str]] = {}
             for row in rows:

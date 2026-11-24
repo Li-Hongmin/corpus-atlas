@@ -50,6 +50,11 @@ corpus-atlas paper search investigations/example "distribution shift"
 corpus-atlas paper retrieve investigations/example --paper smith2026causal \
   --url 'https://repository.example/paper.pdf' --source 'Institutional repository' \
   --license 'CC-BY-4.0' --role main
+corpus-atlas paper retrieve-all investigations/example --email you@example.org --max-workers 4
+corpus-atlas paper supplements investigations/example --apply
+corpus-atlas paper publications investigations/example          # preview; add --apply to update
+corpus-atlas paper citations investigations/example --paper smith2026causal --cache
+corpus-atlas paper check investigations/example --restore-from ~/backup   # preview restore by sha256
 corpus-atlas paper dedupe investigations/example
 corpus-atlas paper export-bib investigations/example --output corpus.bib
 ```
@@ -58,6 +63,13 @@ Paper records retain DOI, arXiv, PMID, Semantic Scholar and OpenAlex identifiers
 backward references, forward citations, reading status, full-text status, and separately recorded
 main-text and supplementary attachments. A paper belongs to the corpus when its record is admitted;
 a PDF is optional.
+
+`retrieve-all` resolves legal open-access copies only (OpenAlex locations, Unpaywall when an email is
+given via `--email` or `CORPUS_ATLAS_EMAIL`, Europe PMC/PMC, arXiv, bioRxiv/medRxiv), tries them in
+order, accepts only real PDFs, and never bypasses paywalls, logins, or CAPTCHAs. It is resumable and
+writes a JSON report plus `reports/fulltext-failures.csv` for manual browser follow-up. Attachments
+are named with an extension inferred from magic bytes or content type and recorded with source,
+license, and sha256. Discovery providers: `openalex`, `crossref`, `semanticscholar`.
 
 ## Codex plugin
 

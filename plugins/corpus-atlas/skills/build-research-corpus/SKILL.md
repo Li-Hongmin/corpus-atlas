@@ -1,6 +1,6 @@
 ---
 name: build-research-corpus
-description: Build and maintain a local, traceable investigation corpus from web pages, documents, datasets, scholarly papers, company filings, government records, policy materials, and news. Includes scholarly discovery through OpenAlex or Crossref, bibliographic and citation caching, local paper search, legal full-text and supplement retrieval, duplicate previews, and BibTeX export. Use for scientific literature research, financial or company analysis, public-policy and social-issue investigations, event timelines, source verification, competing-hypothesis analysis, claim-evidence mapping, and any task where searches and retrieved materials should remain reusable in a local workspace. Do not use for casual questions that do not benefit from persistent sources or for unsupported automatic truth judgments.
+description: Build and maintain a local, traceable investigation corpus from web pages, documents, datasets, scholarly papers, company filings, government records, policy materials, and news. Includes scholarly discovery through OpenAlex, Crossref, or Semantic Scholar, bibliographic and citation caching, local paper search, legal full-text and supplement retrieval, duplicate previews, and BibTeX export. Use for scientific literature research, financial or company analysis, public-policy and social-issue investigations, event timelines, source verification, competing-hypothesis analysis, claim-evidence mapping, and any task where searches and retrieved materials should remain reusable in a local workspace. Do not use for casual questions that do not benefit from persistent sources or for unsupported automatic truth judgments.
 ---
 
 # Build Research Corpus
@@ -34,7 +34,7 @@ Read the matching file in `references/` before collecting domain-specific eviden
 ## Build A Scholarly Corpus
 
 For scientific work, use Corpus Atlas as the library rather than treating papers as generic URLs.
-Discover current records through OpenAlex or Crossref and cache admitted results:
+Discover current records through OpenAlex, Crossref, or Semantic Scholar and cache admitted results:
 
 ```bash
 corpus-atlas paper discover WORKSPACE --query "research question" \
@@ -58,6 +58,28 @@ Retrieve only a verified lawful main text or supplement, always recording its so
 corpus-atlas paper retrieve WORKSPACE --paper CITATION_KEY \
   --url 'https://repository.example/paper.pdf' --source 'Repository name' \
   --license 'CC-BY-4.0' --role main
+```
+
+If the given URL fails (for example a publisher 403) the main-text retrieve falls back to other legal
+OA locations and lists every attempt. For the whole corpus, resolve and download automatically:
+
+```bash
+export CORPUS_ATLAS_EMAIL=you@example.org   # enables Unpaywall; polite-pool contact
+corpus-atlas paper retrieve-all WORKSPACE --max-workers 4
+corpus-atlas paper resolve WORKSPACE --paper CITATION_KEY      # inspect candidates only
+```
+
+Candidates are tried in order: OpenAlex best/other OA locations, Unpaywall, Europe PMC/PMC, arXiv,
+bioRxiv/medRxiv. Only a real PDF is accepted; landing pages, logins, and 403s are recorded as
+failures. `retrieve-all` is resumable (local full texts are skipped) and writes
+`reports/retrieve-all-*.json` plus `reports/fulltext-failures.csv`, a queue for manual follow-up in a
+browser through the user's own legitimate access. Files get extensions from magic bytes/content type.
+
+```bash
+corpus-atlas paper supplements WORKSPACE [--apply]   # Europe PMC supplementary files; preview default
+corpus-atlas paper publications WORKSPACE [--apply]  # preprint -> published DOI; preview default
+corpus-atlas paper citations WORKSPACE --paper KEY --provider openalex [--cache]
+corpus-atlas paper check WORKSPACE [--restore-from DIR [--apply]]  # sha256 integrity / restore preview
 ```
 
 Use `--role supplement` for datasets, spreadsheets, archives, and other supplementary files. Never
