@@ -17,6 +17,7 @@ from typing import Any
 
 from . import fulltext as ft
 from .scholarly import citation_key, current_time, normalize_doi, normalized_title
+from .urls import sanitize_obj, sanitize_url
 
 LINKS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_links (
@@ -74,7 +75,7 @@ def store_record_links(connection: sqlite3.Connection, paper_id: str, record: di
         links.append(("supplement", entry["url"], entry["source"], entry["license"], entry["filename"]))
     for kind, url, source, license_name, filename in links:
         connection.execute("INSERT OR IGNORE INTO paper_links VALUES (?,?,?,?,?,?,?)",
-                           (f"lnk_{uuid.uuid4().hex[:12]}", paper_id, kind, url, source, license_name, filename))
+                           (f"lnk_{uuid.uuid4().hex[:12]}", paper_id, kind, sanitize_url(url), source, license_name, filename))
     return len(links)
 
 
@@ -163,12 +164,12 @@ def write_browser_queue(root: Path, rows: list[dict[str, str]]) -> Path:
         with path.open(encoding="utf-8", newline="") as stream:
             for row in csv.DictReader(stream):
                 existing[(row.get("citation_key", ""), row.get("kind", ""))] = row
-    for row in rows:
+    for row in sanitize_obj(rows):
         existing[(row["citation_key"], row["kind"])] = {**{f: "" for f in QUEUE_FIELDS}, **row}
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=QUEUE_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(sorted(existing.values(), key=lambda r: (r["kind"], r["citation_key"])))
+        writer.writerows(sorted(sanitize_obj(list(existing.values())), key=lambda r: (r["kind"], r["citation_key"])))
     return path
 
 
@@ -255,14 +256,103 @@ def _score(connection: sqlite3.Connection, row: sqlite3.Row) -> tuple:
     return (files > 0, not preprint, filled, -len(row["citation_key"]))
 
 
-def dedupe(connection: sqlite3.Connection, apply: bool) -> list[dict[str, Any]]:
-    """Group by DOI/arXiv/PMID/normalized title/identical main PDF; keep the richest record."""
+SCORE_RULES = ("has-main-file", "not-preprint", "most-complete-metadata", "shortest-citation-key")
+DEFAULT_PREFERENCES = ("config/duplicate-preferences.yaml", "config/duplicate-preferences.yml",
+                       "config/duplicate-preferences.json", "config/duplicate-pdf-preferences.yaml")
+
+
+def load_preferences(path: Path) -> dict[str, str]:
+    """paper-lib format: ``duplicates: {<group key>: {preferred: <record>}}`` (YAML or JSON).
+
+    ``<group key>`` is the sha256 of a duplicated main file (paper-lib), or any member's
+    citation key / DOI / arXiv ID / paper ID. ``<record>`` names the record to keep by
+    citation key, paper ID, DOI, or arXiv ID. A bare ``{<group key>: <record>}`` mapping
+    is also accepted."""
+    from .yamlio import YAMLError, load_yaml
+    try:
+        text = path.read_text(encoding="utf-8")
+        payload = json.loads(text) if path.suffix.lower() == ".json" else load_yaml(text)
+    except (OSError, json.JSONDecodeError, YAMLError) as error:
+        raise SystemExit(f"Could not read duplicate preferences {path}: {error}") from error
+    payload = payload or {}
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Duplicate preferences must be a mapping: {path}")
+    groups = payload.get("duplicates", payload)
+    if not isinstance(groups, dict):
+        raise SystemExit(f"'duplicates' must be a mapping: {path}")
+    output = {}
+    for key, item in groups.items():
+        preferred = item.get("preferred") if isinstance(item, dict) else item
+        if not preferred:
+            raise SystemExit(f"Duplicate preference {key!r} has no 'preferred' record")
+        output[str(key).strip().lower()] = str(preferred).strip()
+    return output
+
+
+def find_preferences(root: Path, explicit: str | None) -> Path | None:
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(f"Duplicate preferences file not found: {path}")
+        return path
+    return next((root / name for name in DEFAULT_PREFERENCES if (root / name).is_file()), None)
+
+
+def _member_aliases(connection: sqlite3.Connection, row: sqlite3.Row) -> set[str]:
+    aliases = {row["id"], row["citation_key"], row["doi"] or "", row["arxiv"] or "", row["pmid"] or ""}
+    aliases.update(r["sha256"] for r in connection.execute("SELECT sha256 FROM paper_files WHERE paper_id=? AND role='main'", (row["id"],)))
+    return {alias.lower() for alias in aliases if alias}
+
+
+def _preferred(connection: sqlite3.Connection, group: list[sqlite3.Row], preferences: dict[str, str]) -> tuple[sqlite3.Row | None, str]:
+    aliases = {row["id"]: _member_aliases(connection, row) for row in group}
+    every = set().union(*aliases.values())
+    matched = {key: value for key, value in preferences.items() if key in every}
+    if not matched:
+        return None, ""
+    choices = set()
+    for key, value in matched.items():
+        winners = [row for row in group if value.lower() in aliases[row["id"]]]
+        if not winners:
+            raise SystemExit(f"Invalid duplicate preference for {key}: {value} is not a member of "
+                             f"{sorted(row['citation_key'] for row in group)}")
+        choices.add(winners[0]["id"])
+    if len(choices) != 1:
+        raise SystemExit(f"Conflicting duplicate preferences for {sorted(row['citation_key'] for row in group)}: {sorted(matched)}")
+    keeper = next(row for row in group if row["id"] in choices)
+    return keeper, "preference:" + ",".join(sorted(matched))
+
+
+def _deciding_rule(connection: sqlite3.Connection, keeper: sqlite3.Row, group: list[sqlite3.Row]) -> str:
+    best = _score(connection, keeper)
+    runner = max((_score(connection, row) for row in group if row["id"] != keeper["id"]), default=best)
+    for rule, mine, theirs in zip(SCORE_RULES, best, runner):
+        if mine != theirs:
+            return f"score:{rule}"
+    return "score:first-imported"
+
+
+def dedupe(connection: sqlite3.Connection, apply: bool, preferences: dict[str, str] | None = None,
+           require_preferences: bool = False) -> list[dict[str, Any]]:
+    """Group by DOI/arXiv/PMID/normalized title/identical main PDF; keep the record named
+    by a manual preference, else the richest record. Each entry reports the deciding rule."""
     connection.executescript(LINKS_SCHEMA)
+    preferences = preferences or {}
     report = []
-    for group in _identity_groups(connection):
-        keeper = max(group, key=lambda r: _score(connection, r))
+    groups = _identity_groups(connection)
+    plans = []
+    for group in groups:
+        keeper, rule = _preferred(connection, group, preferences)
+        if keeper is None:
+            if require_preferences:
+                raise SystemExit("Duplicate group needs an explicit preference: "
+                                 + ", ".join(sorted(row["citation_key"] for row in group)))
+            keeper = max(group, key=lambda r: _score(connection, r))
+            rule = _deciding_rule(connection, keeper, group)
+        plans.append((group, keeper, rule))
+    for group, keeper, rule in plans:
         others = [row for row in group if row["id"] != keeper["id"]]
-        entry = {"keep": keeper["citation_key"], "merge": [row["citation_key"] for row in others], "applied": False}
+        entry = {"keep": keeper["citation_key"], "merge": [row["citation_key"] for row in others], "rule": rule, "applied": False}
         if apply:
             for row in others:
                 updates = {key: row[key] for key in ("doi", "arxiv", "pmid", "semantic_scholar_id", "openalex_id", "venue",
@@ -315,7 +405,7 @@ def normalize_keys(connection: sqlite3.Connection, root: Path, apply: bool) -> l
         moves = []
         for file_row in files:
             suffix = Path(file_row["local_file"]).suffix.lower() or ".bin"
-            label = "" if file_row["role"] == "main" else "-supplement"
+            label = {"main": "", "preprint": "-preprint"}.get(file_row["role"], "-supplement")
             group = file_row["role"] + (suffix if label else "")
             numbers[group] = numbers.get(group, 0) + 1
             n = numbers[group]

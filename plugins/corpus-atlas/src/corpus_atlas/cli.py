@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .urls import sanitize_obj, sanitize_url
 from .scholarly import (
     add_scholarly_parsers,
     dispatch_scholarly,
@@ -95,6 +96,7 @@ def write_snapshot(root: Path, connection: sqlite3.Connection) -> None:
         "evidence_links": [dict(row) for row in connection.execute("SELECT * FROM evidence_links ORDER BY created_at, id")],
         **scholarly_snapshot(connection),
     }
+    data = sanitize_obj(data)
     (root / "atlas.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -142,7 +144,7 @@ def command_source_add(args: argparse.Namespace) -> None:
             """INSERT INTO sources
                (id,title,url,source_type,publisher,published_at,accessed_at,local_file,sha256,status,notes,created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (source_id, args.title, args.url, args.source_type, args.publisher,
+            (source_id, args.title, sanitize_url(args.url), args.source_type, args.publisher,
              args.published_at, args.accessed_at or now(), local_file, digest,
              args.status, args.notes, now()),
         )

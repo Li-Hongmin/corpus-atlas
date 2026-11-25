@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .urls import sanitize_obj, sanitize_url
+from .yamlio import YAMLError, load_yaml
+
 
 USER_AGENT = "Mozilla/5.0 (compatible; CorpusAtlas/0.3; +https://github.com/Li-Hongmin/corpus-atlas)"
 
@@ -112,51 +115,9 @@ def stable_identifier(value: Any) -> str:
     return str(value)
 
 
-def _scalar(text: str) -> Any:
-    text = text.strip()
-    if not text or text in {"~", "null"}:
-        return None
-    if text[0] in "[{\"":
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-    if text[0] == text[-1] == "'" and len(text) > 1:
-        return text[1:-1].replace("''", "'")
-    if re.fullmatch(r"-?\d+", text):
-        return int(text)
-    return text
-
-
 def parse_simple_yaml(text: str) -> Any:
-    """Minimal YAML subset (stdlib only): top-level mapping or list of mappings with
-    scalar values, inline JSON values, and ``- item`` lists. Use JSON for anything richer."""
-    records: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    last_key: str | None = None
-    for raw in text.splitlines():
-        if not raw.strip() or raw.lstrip().startswith("#") or raw.strip() == "---":
-            continue
-        indent = len(raw) - len(raw.lstrip())
-        line = raw.strip()
-        if indent == 0 and line.startswith("- ") and ":" in line:
-            current = {}
-            records.append(current)
-            line = line[2:]
-            indent = 2
-        if current is None:
-            current = {}
-            records.append(current)
-        if line.startswith("- ") and last_key:
-            if not isinstance(current.get(last_key), list):
-                current[last_key] = []
-            current[last_key].append(_scalar(line[2:]))
-            continue
-        if ":" in line:
-            key, _, value = line.partition(":")
-            last_key = key.strip()
-            current[last_key] = _scalar(value)
-    return records[0] if len(records) == 1 and not text.lstrip().startswith("- ") else records
+    """Backward-compatible alias: full YAML via :func:`corpus_atlas.yamlio.load_yaml`."""
+    return load_yaml(text)
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -169,7 +130,10 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         if path.suffix.lower() not in {".yaml", ".yml"}:
             raise SystemExit(f"Could not parse {path.name} as JSON")
-        data = parse_simple_yaml(text)
+        try:
+            data = load_yaml(text)
+        except YAMLError as error:
+            raise SystemExit(f"Could not parse {path.name} as YAML: {error}") from error
     if isinstance(data, dict) and isinstance(data.get("records") or data.get("papers"), list):
         data = data.get("records") or data.get("papers")
     if isinstance(data, dict):
@@ -214,7 +178,7 @@ def cache_record(connection: sqlite3.Connection, record: dict[str, Any]) -> tupl
         "doi": normalize_doi(record.get("doi")), "arxiv": normalize_arxiv(record.get("arxiv") or record.get("eprint")),
         "pmid": str(record.get("pmid") or "") or None, "semantic_scholar_id": record.get("semantic_scholar_id"),
         "openalex_id": record.get("openalex_id"), "venue": record.get("venue") or record.get("journal"),
-        "publisher": record.get("publisher"), "abstract": record.get("abstract"), "url": record.get("url"),
+        "publisher": record.get("publisher"), "abstract": record.get("abstract"), "url": sanitize_url(record.get("url")),
         "metadata_source": record.get("metadata_source") or record.get("source"),
         "search_date": record.get("search_date") or datetime.now().date().isoformat(),
         "reading_status": record.get("reading_status") or ("metadata-only" if not existing else None),
@@ -305,13 +269,13 @@ def add_scholarly_parsers(commands: argparse._SubParsersAction) -> None:
     search = paper.add_parser("search"); search.add_argument("path"); search.add_argument("query")
     retrieve = paper.add_parser("retrieve"); retrieve.add_argument("path"); retrieve.add_argument("--paper", required=True); retrieve.add_argument("--url", help="explicit legal URL; omit to auto-resolve OA locations"); retrieve.add_argument("--license"); retrieve.add_argument("--source"); retrieve.add_argument("--role", choices=("main", "supplement"), default="main"); retrieve.add_argument("--filename")
     retrieve.add_argument("--no-fallback", action="store_true", help="do not try alternative OA locations when the URL fails"); retrieve.add_argument("--email")
-    batch = paper.add_parser("retrieve-all", help="resolve and download legal OA full texts for all cached papers"); batch.add_argument("path"); batch.add_argument("--email", help="contact email for Unpaywall/OpenAlex (or CORPUS_ATLAS_EMAIL)"); batch.add_argument("--max-workers", type=int, default=4); batch.add_argument("--limit", type=int); batch.add_argument("--skip-failed", action="store_true", help="do not retry papers that failed before")
+    batch = paper.add_parser("retrieve-all", help="resolve and download legal OA full texts for all cached papers"); batch.add_argument("path"); batch.add_argument("--email", help="contact email for Unpaywall/OpenAlex (or CORPUS_ATLAS_EMAIL)"); batch.add_argument("--max-workers", type=int, default=4); batch.add_argument("--limit", type=int); batch.add_argument("--skip-failed", action="store_true", help="do not retry papers that failed before"); batch.add_argument("--transport", choices=("auto", "python", "aria2"), default="auto", help="bulk download transport (auto: aria2c when on PATH)"); batch.add_argument("--connections", type=int, default=2, help="aria2 connections per server/file (1-4)"); batch.add_argument("--no-python-fallback", action="store_true", help="with aria2, do not retry failures with the Python transport")
     resolve = paper.add_parser("resolve", help="list legal OA candidates for one paper"); resolve.add_argument("path"); resolve.add_argument("--paper", required=True); resolve.add_argument("--email")
-    supp = paper.add_parser("supplements", help="discover/backfill repository supplementary files (preview by default)"); supp.add_argument("path"); supp.add_argument("--paper"); supp.add_argument("--email"); supp.add_argument("--apply", action="store_true"); supp.add_argument("--no-publisher-pages", action="store_true", help="skip publisher-page ESM/mmc rules"); supp.add_argument("--max-workers", type=int, default=4)
-    pubs = paper.add_parser("publications", help="check preprints for published versions (preview by default)"); pubs.add_argument("path"); pubs.add_argument("--email"); pubs.add_argument("--apply", action="store_true")
+    supp = paper.add_parser("supplements", help="discover/backfill repository supplementary files (preview by default)"); supp.add_argument("path"); supp.add_argument("--paper"); supp.add_argument("--email"); supp.add_argument("--apply", action="store_true"); supp.add_argument("--no-publisher-pages", action="store_true", help="skip publisher-page ESM/mmc rules"); supp.add_argument("--max-workers", type=int, default=4); supp.add_argument("--transport", choices=("auto", "python", "aria2"), default="auto", help="bulk download transport (auto: aria2c when on PATH)"); supp.add_argument("--connections", type=int, default=2, help="aria2 connections per server/file (1-4)"); supp.add_argument("--no-python-fallback", action="store_true", help="with aria2, do not retry failures with the Python transport")
+    pubs = paper.add_parser("publications", help="check preprints for published versions (preview by default)"); pubs.add_argument("path"); pubs.add_argument("--email"); pubs.add_argument("--apply", action="store_true"); pubs.add_argument("--no-download", action="store_true", help="only record the published DOI; do not fetch the published PDF"); pubs.add_argument("--prune-preprint", action="store_true", help="delete the preprint attachment once the published PDF is verified (default: keep it as role=preprint)")
     chk = paper.add_parser("check", help="verify attachments by sha256; optional restore preview"); chk.add_argument("path"); chk.add_argument("--restore-from"); chk.add_argument("--apply", action="store_true")
     cites = paper.add_parser("citations", help="cache forward citations of a paper"); cites.add_argument("path"); cites.add_argument("--paper", required=True); cites.add_argument("--provider", choices=("openalex", "semanticscholar"), default="openalex"); cites.add_argument("--limit", type=int, default=25); cites.add_argument("--cache", action="store_true"); cites.add_argument("--email")
-    dedupe = paper.add_parser("dedupe", help="DOI/arXiv/PMID/title/sha256 duplicate groups (preview; --apply merges)"); dedupe.add_argument("path"); dedupe.add_argument("--apply", action="store_true")
+    dedupe = paper.add_parser("dedupe", help="DOI/arXiv/PMID/title/sha256 duplicate groups (preview; --apply merges)"); dedupe.add_argument("path"); dedupe.add_argument("--apply", action="store_true"); dedupe.add_argument("--preferences", help="YAML/JSON duplicate preferences (default: <workspace>/config/duplicate-preferences.yaml)"); dedupe.add_argument("--require-preferences", action="store_true", help="fail if any duplicate group has no explicit preference")
     bib = paper.add_parser("export-bib", help="canonical BibTeX export"); bib.add_argument("path"); bib.add_argument("--output", required=True); bib.add_argument("--include-files", action="store_true")
 
 
@@ -343,7 +307,7 @@ def dispatch_scholarly(args: argparse.Namespace, workspace: Callable, connect: C
             row = connection.execute("SELECT * FROM papers WHERE id=? OR citation_key=? OR doi=?", (ref, ref, normalize_doi(ref))).fetchone()
             if not row: raise SystemExit(f"Unknown paper: {ref}")
             return row
-        def emit(value: Any) -> None: print(json.dumps(value, ensure_ascii=False, indent=2))
+        def emit(value: Any) -> None: print(json.dumps(sanitize_obj(value), ensure_ascii=False, indent=2))
         if args.paper_command == "retrieve" and not args.url:
             paper_row = find_paper(args.paper)
             data = dict(paper_row)
@@ -373,16 +337,16 @@ def dispatch_scholarly(args: argparse.Namespace, workspace: Callable, connect: C
             stored = ft.store_file(connection, root, paper_row, args.role, response.body, candidate["url"], candidate["source"], candidate["license"], response.content_type, args.filename or "")
             write_snapshot(root, connection); emit({**stored, "file": str(root / stored["file"]), "source": candidate["source"], "fallback_attempts": attempts}); return
         if args.paper_command == "retrieve-all":
-            summary = ft.retrieve_all(connection, root, email, args.max_workers, args.limit, not args.skip_failed)
+            summary = ft.retrieve_all(connection, root, email, args.max_workers, args.limit, not args.skip_failed, args.transport, args.connections, not args.no_python_fallback)
             write_snapshot(root, connection); emit(summary); return
         if args.paper_command == "resolve":
             emit(ft.resolve_candidates(dict(find_paper(args.paper)), email)); return
         if args.paper_command == "supplements":
-            report = ft.supplements(connection, root, email, args.apply, args.paper, not args.no_publisher_pages, args.max_workers)
+            report = ft.supplements(connection, root, email, args.apply, args.paper, not args.no_publisher_pages, args.max_workers, args.transport, args.connections, not args.no_python_fallback)
             if args.apply: write_snapshot(root, connection)
             emit(report); return
         if args.paper_command == "publications":
-            report = ft.publications(connection, email, args.apply)
+            report = ft.publications(connection, email, args.apply, root, not args.no_download, args.prune_preprint)
             if args.apply: write_snapshot(root, connection)
             emit(report); return
         if args.paper_command == "check":
@@ -397,7 +361,8 @@ def dispatch_scholarly(args: argparse.Namespace, workspace: Callable, connect: C
             write_snapshot(root, connection); emit(rows); return
         from . import library as lib
         if args.paper_command == "dedupe":
-            report = lib.dedupe(connection, args.apply)
+            pref_path = lib.find_preferences(root, args.preferences)
+            report = lib.dedupe(connection, args.apply, lib.load_preferences(pref_path) if pref_path else {}, args.require_preferences)
             if args.apply: write_snapshot(root, connection)
             emit(report); return
         if args.paper_command == "normalize":
