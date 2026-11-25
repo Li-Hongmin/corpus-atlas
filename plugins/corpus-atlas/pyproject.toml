@@ -8,6 +8,9 @@ license = "MIT"
 authors = [{name = "Li Hongmin"}]
 dependencies = []
 
+[project.optional-dependencies]
+yaml = ["PyYAML>=6"]
+
 [project.scripts]
 corpus-atlas = "corpus_atlas.cli:main"
 

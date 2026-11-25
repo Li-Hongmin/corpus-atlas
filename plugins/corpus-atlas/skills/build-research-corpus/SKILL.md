@@ -65,7 +65,7 @@ OA locations and lists every attempt. For the whole corpus, resolve and download
 
 ```bash
 export CORPUS_ATLAS_EMAIL=you@example.org   # enables Unpaywall; polite-pool contact
-corpus-atlas paper retrieve-all WORKSPACE --max-workers 4
+corpus-atlas paper retrieve-all WORKSPACE --max-workers 4 [--transport auto|python|aria2]
 corpus-atlas paper resolve WORKSPACE --paper CITATION_KEY      # inspect candidates only
 ```
 
@@ -82,7 +82,7 @@ Import a literature matrix with `paper import-matrix WORKSPACE --from matrix.csv
 corpus-atlas paper supplements WORKSPACE [--apply]   # matrix URLs, Europe PMC ZIP, publisher ESM/mmc/SI pages
 corpus-atlas paper browser-queue WORKSPACE           # items left for the user's own legitimate browser access
 corpus-atlas paper import-browser-results WORKSPACE --from results.csv [--apply]  # needs source+license per file
-corpus-atlas paper publications WORKSPACE [--apply]  # preprint -> published DOI; preview default
+corpus-atlas paper publications WORKSPACE [--apply [--prune-preprint]]  # published DOI + PDF; preprint kept as role=preprint
 corpus-atlas paper citations WORKSPACE --paper KEY --provider openalex [--cache]
 corpus-atlas paper check WORKSPACE [--restore-from DIR [--apply]]  # sha256 integrity / restore preview
 ```
@@ -92,13 +92,15 @@ bypass authentication, CAPTCHA, access controls, or paywalls. Search the local c
 
 ```bash
 corpus-atlas paper search WORKSPACE 'title, author, abstract, or DOI query'
-corpus-atlas paper dedupe WORKSPACE [--apply]
+corpus-atlas paper dedupe WORKSPACE [--preferences prefs.yaml] [--apply]
 corpus-atlas paper normalize WORKSPACE [--apply]     # canonical author+year+keyword keys and file names
 corpus-atlas paper export-bib WORKSPACE --output corpus.bib
 ```
 
-`paper dedupe` previews by default; `--apply` merges into the record with a main PDF/published DOI/most
-fields. Prefer DOI, arXiv, or PMID identity; use normalized title
+`paper dedupe` previews by default and reports the deciding `rule`; a preferences file
+(`duplicates: {<sha256|key|DOI>: {preferred: <key>}}`) overrides the score; `--apply` otherwise merges
+into the record with a main PDF/published DOI/most fields. Stored URLs are stripped of tokens and
+signatures; aria2 (`--transport auto`) is used for bulk downloads when installed. Prefer DOI, arXiv, or PMID identity; use normalized title
 and year only as a candidate signal. Read `references/science.md` for the retrieval ladder and
 evidence-level rules.
 

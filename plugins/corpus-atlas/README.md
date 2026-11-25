@@ -51,16 +51,16 @@ corpus-atlas paper retrieve investigations/example --paper smith2026causal \
   --url 'https://repository.example/paper.pdf' --source 'Institutional repository' \
   --license 'CC-BY-4.0' --role main
 corpus-atlas paper import-matrix investigations/example --from literature-matrix.csv  # open_access_pdf, supplement_urls
-corpus-atlas paper cache-record investigations/example --from record.json      # JSON or simple YAML
+corpus-atlas paper cache-record investigations/example --from record.yaml      # JSON, YAML, CSV/TSV
 corpus-atlas paper retrieve investigations/example --paper smith2026causal     # no --url: auto-resolve OA
-corpus-atlas paper retrieve-all investigations/example --email you@example.org --max-workers 8
+corpus-atlas paper retrieve-all investigations/example --email you@example.org --max-workers 8 --transport auto
 corpus-atlas paper supplements investigations/example --apply --max-workers 8
 corpus-atlas paper browser-queue investigations/example                         # manual/browser worklist
 corpus-atlas paper import-browser-results investigations/example --from results.csv [--apply]
-corpus-atlas paper publications investigations/example          # preview; add --apply to update
+corpus-atlas paper publications investigations/example          # preview; --apply records DOI + fetches published PDF [--prune-preprint]
 corpus-atlas paper citations investigations/example --paper smith2026causal --cache
 corpus-atlas paper check investigations/example --restore-from ~/backup   # preview restore by sha256
-corpus-atlas paper dedupe investigations/example        # preview; --apply merges into the richest record
+corpus-atlas paper dedupe investigations/example        # preview (shows deciding rule); --apply merges [--preferences prefs.yaml]
 corpus-atlas paper normalize investigations/example     # canonical keys/filenames; preview; --apply
 corpus-atlas paper export-bib investigations/example --output corpus.bib [--include-files]
 ```
@@ -87,6 +87,33 @@ are rejected. Unresolved items go to the browser queue; files fetched by hand ar
 source and license for every file. Attachments
 are named with an extension inferred from magic bytes or content type and recorded with source,
 license, and sha256. Discovery providers: `openalex`, `crossref`, `semanticscholar`.
+
+`--transport auto|python|aria2` (retrieve-all, supplements): `auto` uses `aria2c` when it is on
+PATH (input file, `--connections` per server/file, `--continue` resume in `.staging/aria2/`);
+every payload is then validated (PDF magic / OA package, supplement rules) and recorded with the
+same sha256/source/license rows as the Python transport. Failed aria2 downloads are retried with
+Python unless `--no-python-fallback`; if aria2c cannot run, the whole batch uses Python.
+
+`publications --apply` records the published DOI and venue (the arXiv ID is kept), then fetches the
+published PDF from a non-preprint legal OA location (never arXiv/bioRxiv/`submittedVersion`). Once
+verified (PDF, >=10 KB, and title coverage on pages 1-3 when `pdftotext` is installed), the old
+attachment becomes `role=preprint`; `--prune-preprint` deletes it instead. `--no-download` skips the
+PDF step.
+
+`dedupe` keeps the record named in a preferences file (`--preferences`, default
+`<workspace>/config/duplicate-preferences.yaml`; paper-lib format
+`duplicates: {<sha256|citation key|DOI|arXiv>: {preferred: <citation key|DOI|arXiv|id>}}`), else the
+best-scoring record; each group reports its `rule` (`preference:...` or `score:...`).
+`--require-preferences` fails on groups without an explicit choice.
+
+URLs are sanitised before they are stored or reported (DB, `atlas.json`, reports, browser queue):
+credentials in the userinfo part and sensitive query keys (`token`, `key`, `apikey`, `api_key`,
+`access_token`, `sig`, `signature`, `X-Amz-*`, `X-Goog-*`, `Expires`, `Policy`, `Key-Pair-Id`,
+`session`, `auth`, ...) are dropped; a signed wrapper with an https `redirect_uri` is replaced by it.
+
+YAML input uses PyYAML when installed (`pip install 'corpus-atlas[yaml]'`); otherwise a built-in
+parser handles nested mappings/lists, quoted and multi-line scalars, flow `[]`/`{}`, `|`/`>` block
+scalars, and comments, and rejects anchors, aliases, tags, and multiple documents with a line number.
 
 ## Codex plugin
 

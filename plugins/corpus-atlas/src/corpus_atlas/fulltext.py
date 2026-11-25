@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from .scholarly import current_time, normalize_arxiv, normalize_doi, normalized_title
+from .urls import sanitize_obj, sanitize_url
 
 PROJECT_URL = "https://github.com/Li-Hongmin/corpus-atlas"
 MAX_BYTES = 200 * 1024 * 1024
@@ -210,7 +211,8 @@ def openalex_candidates(paper: dict[str, Any], email: str | None) -> list[dict[s
             continue
         source = (location.get("source") or {}).get("display_name") or "OpenAlex location"
         result.append({"url": location["pdf_url"], "source": f"OpenAlex: {source}",
-                       "license": location.get("license") or "open-access (license unspecified)"})
+                       "license": location.get("license") or "open-access (license unspecified)",
+                       "version": location.get("version") or ""})
     return result
 
 
@@ -220,7 +222,7 @@ def unpaywall_candidates(paper: dict[str, Any], email: str | None) -> list[dict[
     data = get_json(f"https://api.unpaywall.org/v2/{urllib.parse.quote(paper['doi'], safe='/')}?email={urllib.parse.quote(email)}", email) or {}
     locations = [data.get("best_oa_location")] + list(data.get("oa_locations") or [])
     return [{"url": loc["url_for_pdf"], "source": f"Unpaywall: {loc.get('host_type') or 'location'}",
-             "license": loc.get("license") or "open-access (license unspecified)"}
+             "license": loc.get("license") or "open-access (license unspecified)", "version": loc.get("version") or ""}
             for loc in locations if loc and loc.get("url_for_pdf")]
 
 
@@ -396,11 +398,14 @@ def iter_candidates(paper: dict[str, Any], email: str | None = None):
                 yield candidate
 
 
-def fetch_fulltext(paper: dict[str, Any], email: str | None = None) -> dict[str, Any]:
-    """Try each legal candidate in order; return the first real PDF or all failures."""
+def fetch_fulltext(paper: dict[str, Any], email: str | None = None, accept=None) -> dict[str, Any]:
+    """Try each legal candidate in order; return the first real PDF or all failures.
+    ``accept(candidate)`` may veto candidates (e.g. preprint servers)."""
     attempts: list[dict[str, str]] = []
     candidates = []
     for candidate in iter_candidates(paper, email):
+        if accept is not None and not accept(candidate):
+            continue
         candidates.append(candidate)
         url = candidate["url"]
         if url.startswith("http://"):
@@ -427,6 +432,7 @@ def fetch_fulltext(paper: dict[str, Any], email: str | None = None) -> dict[str,
 def store_file(connection: sqlite3.Connection, root: Path, paper: sqlite3.Row | dict, role: str, body: bytes,
                url: str, source: str, license_name: str, content_type: str, original: str = "") -> dict[str, Any]:
     extension = infer_extension(body, content_type, original or url)
+    url = sanitize_url(url)
     base = original or Path(urllib.parse.urlparse(url).path).name or role
     name = with_extension(f"{paper['citation_key']}-{role}-{Path(base).stem or role}", extension)
     destination = root / "attachments" / name
@@ -452,8 +458,88 @@ def resolve_email(value: str | None) -> str | None:
     return value or os.environ.get("CORPUS_ATLAS_EMAIL") or os.environ.get("UNPAYWALL_EMAIL") or None
 
 
+def validate_main_payload(body: bytes) -> tuple[bytes | None, str, str]:
+    """Same acceptance rule as :func:`fetch_fulltext`: a PDF, or a PDF inside an OA package."""
+    if len(body) > MAX_BYTES:
+        return None, "", "response exceeds size limit"
+    if body.startswith(b"\x1f\x8b"):
+        extracted = pdf_from_package(body)
+        if extracted:
+            return extracted, "application/pdf (from OA package)", ""
+    if body.startswith(b"%PDF-"):
+        return body, "application/pdf", ""
+    return None, "", f"not a PDF ({infer_extension(body)}); likely landing page or access wall"
+
+
+def _python_outcomes(papers: list[dict[str, Any]], email: str | None, max_workers: int):
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futures = {pool.submit(fetch_fulltext, paper, email): paper for paper in papers}
+        for future in as_completed(futures):
+            paper = futures[future]
+            try:
+                outcome = future.result()
+            except Exception as error:  # keep the batch alive
+                outcome = {"status": "failed", "attempts": [{"url": "", "source": "", "reason": repr(error)}]}
+            outcome["transport"] = "python"
+            yield paper, outcome
+
+
+def _aria2_outcomes(papers: list[dict[str, Any]], root: Path, email: str | None, max_workers: int,
+                    connections: int) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve candidates, then download candidate pass N for every unresolved paper in one
+    aria2c run, validating each payload. Returns (outcomes, papers needing Python fallback)."""
+    from . import transport
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        resolved = dict(zip([p["id"] for p in papers], pool.map(lambda p: resolve_candidates(p, email), papers)))
+    by_id = {paper["id"]: paper for paper in papers}
+    attempts: dict[str, list[dict[str, str]]] = {pid: [] for pid in by_id}
+    outcomes: dict[str, dict[str, Any]] = {}
+    staging = root / ".staging" / "aria2"
+    deferred: set[str] = set()
+    for index in range(max((len(c) for c in resolved.values()), default=0)):
+        jobs = []
+        for pid in by_id:
+            if pid in outcomes or pid in deferred or index >= len(resolved[pid]):
+                continue
+            if transport.python_only(resolved[pid][index]["url"]):
+                deferred.add(pid)  # keep candidate order: the Python transport continues from here
+                continue
+            jobs.append({"id": pid, "url": resolved[pid][index]["url"]})
+        if not jobs:
+            continue
+        results = transport.aria2_download(jobs, staging, user_agent=user_agent(email, api=False), accept=PDF_ACCEPT,
+                                           max_concurrent=max(1, max_workers) * 2, connections_per_server=connections,
+                                           split=connections)
+        for job in jobs:
+            pid, candidate, result = job["id"], resolved[job["id"]][index], results[job["id"]]
+            if "error" in result:
+                attempts[pid].append({"url": candidate["url"], "source": candidate["source"], "reason": "aria2: " + result["error"]})
+                if not result["path"].with_name(result["path"].name + ".aria2").exists():
+                    transport.cleanup(result)
+                continue
+            body = result["path"].read_bytes()
+            transport.cleanup(result)
+            payload, ctype, reason = validate_main_payload(body)
+            if payload is None:
+                attempts[pid].append({"url": candidate["url"], "source": candidate["source"], "reason": reason})
+                continue
+            outcomes[pid] = {"status": "downloaded", "candidate": candidate, "body": payload, "content_type": ctype,
+                             "attempts": attempts[pid], "transport": "aria2"}
+    fallback = []
+    for pid, paper in by_id.items():
+        if pid in outcomes:
+            continue
+        if not resolved[pid]:
+            outcomes[pid] = {"status": "no-oa-candidate", "attempts": [], "transport": "aria2"}
+        else:
+            paper["_aria2_attempts"] = attempts[pid]
+            fallback.append(paper)
+    return outcomes, fallback
+
+
 def retrieve_all(connection: sqlite3.Connection, root: Path, email: str | None, max_workers: int,
-                 limit: int | None = None, retry_failed: bool = True) -> dict[str, Any]:
+                 limit: int | None = None, retry_failed: bool = True, transport: str = "python",
+                 connections: int = 2, python_fallback: bool = True) -> dict[str, Any]:
     query = "SELECT * FROM papers WHERE fulltext_status!='local-fulltext' ORDER BY citation_key"
     papers = [dict(row) for row in connection.execute(query)]
     from .library import record_links
@@ -466,32 +552,53 @@ def retrieve_all(connection: sqlite3.Connection, root: Path, email: str | None, 
     prefetch_metadata([p["doi"] for p in papers if p.get("doi")], email)
     already = connection.execute("SELECT COUNT(*) FROM papers WHERE fulltext_status='local-fulltext'").fetchone()[0]
     results = []
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
-        futures = {pool.submit(fetch_fulltext, paper, email): paper for paper in papers}
-        for done, future in enumerate(as_completed(futures), 1):
-            paper = futures[future]
+    from . import transport as tr
+    chosen = tr.choose(transport)
+    notes: list[str] = []
+
+    def outcomes():
+        if chosen == "aria2":
             try:
-                outcome = future.result()
-            except Exception as error:  # keep the batch alive
-                outcome = {"status": "failed", "attempts": [{"url": "", "source": "", "reason": repr(error)}]}
-            row = {"citation_key": paper["citation_key"], "doi": paper["doi"], "title": paper["title"], "status": outcome["status"],
-                   "attempts": outcome["attempts"]}
-            if outcome["status"] == "downloaded":
-                candidate = outcome["candidate"]
-                stored = store_file(connection, root, paper, "main", outcome["body"], candidate["url"], candidate["source"],
-                                    candidate["license"], outcome["content_type"])
-                row.update(file=stored["file"], source=candidate["source"], license=candidate["license"])
-            else:
-                connection.execute("UPDATE papers SET fulltext_status=?,updated_at=? WHERE id=?",
-                                   ("oa-retrieval-failed" if outcome["status"] == "failed" else "no-oa-candidate", current_time(), paper["id"]))
-            connection.commit()  # resumable: every paper is persisted as it finishes
-            results.append(row)
-            print(f"[{done}/{len(papers)}] {row['status']}: {paper['citation_key']}", file=__import__("sys").stderr)
+                done_map, fallback = _aria2_outcomes(papers, root, email, max_workers, connections)
+            except tr.Aria2Unavailable as error:
+                notes.append(f"{error}; fell back to python transport")
+                yield from _python_outcomes(papers, email, max_workers)
+                return
+            by_id = {p["id"]: p for p in papers}
+            for pid, outcome in done_map.items():
+                yield by_id[pid], outcome
+            if not python_fallback:
+                for paper in fallback:
+                    yield paper, {"status": "failed", "attempts": paper.pop("_aria2_attempts"), "transport": "aria2"}
+                return
+            for paper, outcome in _python_outcomes(fallback, email, max_workers):
+                earlier = paper.pop("_aria2_attempts", [])
+                outcome["attempts"] = earlier + outcome["attempts"]
+                outcome["transport"] = "aria2+python-fallback" if outcome["status"] == "downloaded" else "aria2"
+                yield paper, outcome
+        else:
+            yield from _python_outcomes(papers, email, max_workers)
+
+    for done, (paper, outcome) in enumerate(outcomes(), 1):
+        row = {"citation_key": paper["citation_key"], "doi": paper["doi"], "title": paper["title"], "status": outcome["status"],
+               "attempts": outcome["attempts"], "transport": outcome.get("transport", chosen)}
+        if outcome["status"] == "downloaded":
+            candidate = outcome["candidate"]
+            stored = store_file(connection, root, paper, "main", outcome["body"], candidate["url"], candidate["source"],
+                                candidate["license"], outcome["content_type"])
+            row.update(file=stored["file"], source=candidate["source"], license=candidate["license"])
+        else:
+            connection.execute("UPDATE papers SET fulltext_status=?,updated_at=? WHERE id=?",
+                               ("oa-retrieval-failed" if outcome["status"] == "failed" else "no-oa-candidate", current_time(), paper["id"]))
+        connection.commit()  # resumable: every paper is persisted as it finishes
+        results.append(row)
+        print(f"[{done}/{len(papers)}] {row['status']}: {paper['citation_key']}", file=__import__("sys").stderr)
     reports = root / "reports"
     reports.mkdir(exist_ok=True)
     stamp = current_time().replace(":", "").replace("+", "Z")[:17]
     report_path = reports / f"retrieve-all-{stamp}.json"
     failures_path = reports / "fulltext-failures.csv"
+    results = sanitize_obj(results)
     failures = [row for row in results if row["status"] != "downloaded"]
     with failures_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
@@ -509,7 +616,8 @@ def retrieve_all(connection: sqlite3.Connection, root: Path, email: str | None, 
     summary = {"attempted": len(papers), "downloaded": sum(r["status"] == "downloaded" for r in results),
                "failed": sum(r["status"] == "failed" for r in results),
                "no_oa_candidate": sum(r["status"] == "no-oa-candidate" for r in results),
-               "already_local": already, "report": report_path.relative_to(root).as_posix(),
+               "already_local": already, "transport": chosen, **({"notes": notes} if notes else {}),
+               "report": report_path.relative_to(root).as_posix(),
                "failures_csv": failures_path.relative_to(root).as_posix()}
     report_path.write_text(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return summary
@@ -549,14 +657,21 @@ def _fetch_supplement(url: str, source: str, license_name: str, filename: str, e
     return {"body": response.body, "url": url, "source": source, "license": license_name, "content_type": response.content_type, "name": name}
 
 
-def _supplement_job(paper: dict[str, Any], listed: list[dict[str, str]], email: str | None, apply: bool, publisher_pages: bool) -> dict[str, Any]:
-    """Network-only work for one paper (thread-safe); storage happens in the caller."""
+def _defer_supplement(url: str, source: str, license_name: str, filename: str, email: str | None) -> dict[str, Any]:
+    return {"deferred": True, "url": url, "source": source, "license": license_name, "name": filename}
+
+
+def _supplement_job(paper: dict[str, Any], listed: list[dict[str, str]], email: str | None, apply: bool, publisher_pages: bool,
+                    fetch=None) -> dict[str, Any]:
+    """Network-only work for one paper (thread-safe); storage happens in the caller.
+    ``fetch`` defaults to the Python fetcher; the aria2 transport defers file URLs."""
+    fetch = fetch or _fetch_supplement
     from .library import publisher_supplement_links
     job: dict[str, Any] = {"citation_key": paper["citation_key"], "items": [], "errors": [], "sources": []}
     for link in listed:
         job["sources"].append(link.get("source") or "record")
         if apply:
-            got = _fetch_supplement(link["url"], link.get("source") or "record", link.get("license") or "oa-unspecified", link.get("filename") or "", email)
+            got = fetch(link["url"], link.get("source") or "record", link.get("license") or "oa-unspecified", link.get("filename") or "", email)
             (job["errors"] if "error" in got else job["items"]).append(got)
     result = europe_pmc_lookup(paper["doi"], email) if paper.get("doi") else None
     if result and result.get("isOpenAccess") == "Y":
@@ -586,13 +701,58 @@ def _supplement_job(paper: dict[str, Any], listed: list[dict[str, str]], email: 
             job["publisher_links"] = links
             if apply:
                 for link in links:
-                    got = _fetch_supplement(link, f"{label}: {page_url}", "publisher article terms", "", email)
+                    got = fetch(link, f"{label}: {page_url}", "publisher article terms", "", email)
                     (job["errors"] if "error" in got else job["items"]).append(got)
     return job
 
 
+def _resolve_deferred(jobs: list[dict[str, Any]], root: Path, email: str | None, max_workers: int, connections: int,
+                      python_fallback: bool, notes: list[str]) -> None:
+    """Bulk-download deferred supplement URLs with aria2, validate like the Python path,
+    and fall back to Python per file (or entirely, if aria2c cannot run)."""
+    from . import transport as tr
+    from .library import acceptable_supplement
+    for job in jobs:
+        for index, item in enumerate(job["items"]):
+            if item.get("deferred") and tr.python_only(item["url"]):
+                job["items"][index] = _fetch_supplement(item["url"], item["source"], item["license"], item["name"], email)
+    pending = [(job, index) for job in jobs for index, item in enumerate(job["items"]) if item.get("deferred")]
+    if not pending:
+        for job in jobs:
+            job["errors"] += [item for item in job["items"] if "error" in item]
+            job["items"] = [item for item in job["items"] if "error" not in item]
+        return
+    work = [{"id": str(n), "url": job["items"][index]["url"]} for n, (job, index) in enumerate(pending)]
+    try:
+        results = tr.aria2_download(work, root / ".staging" / "aria2", user_agent=user_agent(email, api=False), accept="*/*",
+                                    max_concurrent=max(1, max_workers) * 2, connections_per_server=connections, split=connections)
+    except tr.Aria2Unavailable as error:
+        notes.append(f"{error}; fell back to python transport")
+        results = {str(n): {"error": "aria2 unavailable"} for n in range(len(pending))}
+    for n, (job, index) in enumerate(pending):
+        item, result = job["items"][index], results[str(n)]
+        replacement: dict[str, Any] | None = None
+        if "error" not in result:
+            body = result["path"].read_bytes()
+            tr.cleanup(result)
+            name = item["name"] or Path(urllib.parse.urlparse(item["url"]).path).name
+            ctype = mimetypes.guess_type(name)[0] or ""
+            reason = acceptable_supplement(body, ctype, name)
+            replacement = {"error": reason, "url": item["url"]} if reason else {
+                "body": body, "url": item["url"], "source": item["source"], "license": item["license"], "content_type": ctype, "name": name}
+        if replacement is None and python_fallback:  # download failed; validation rejects are final
+            replacement = _fetch_supplement(item["url"], item["source"], item["license"], item["name"], email)
+        if replacement is None:
+            replacement = {"url": item["url"], "error": "aria2: " + result["error"]}
+        job["items"][index] = replacement
+    for job in jobs:
+        job["errors"] += [item for item in job["items"] if "error" in item]
+        job["items"] = [item for item in job["items"] if "error" not in item]
+
+
 def supplements(connection: sqlite3.Connection, root: Path, email: str | None, apply: bool, paper_ref: str | None,
-                publisher_pages: bool = True, max_workers: int = 4) -> list[dict[str, Any]]:
+                publisher_pages: bool = True, max_workers: int = 4, transport: str = "python", connections: int = 2,
+                python_fallback: bool = True) -> list[dict[str, Any]]:
     """Matrix/record supplement URLs, then Europe PMC supplementary ZIP, then publisher-page
     rules (Springer Nature/BMC ESM, Elsevier mmc, ACS/Wiley/PLOS/Frontiers/MDPI/RSC SI).
     Anything still unresolved is written to reports/browser-queue.csv."""
@@ -603,29 +763,38 @@ def supplements(connection: sqlite3.Connection, root: Path, email: str | None, a
     prefetch_metadata([p["doi"] for p in rows if p.get("doi")], email)
     by_key = {paper["citation_key"]: paper for paper in rows}
     report, queue = [], []
+    from . import transport as tr
+    chosen = tr.choose(transport) if apply else "python"
+    fetch = _defer_supplement if chosen == "aria2" else None
+    notes: list[str] = []
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
-        futures = [pool.submit(_supplement_job, paper, links[paper["id"]], email, apply, publisher_pages) for paper in rows]
-        for future in as_completed(futures):
-            job = future.result()
-            paper = by_key[job["citation_key"]]
-            entry = {k: v for k, v in job.items() if k != "items"}
-            entry["files"] = [store_file(connection, root, paper, "supplement", item["body"], item["url"], item["source"], item["license"],
-                                         item["content_type"], item["name"]) for item in job["items"]]
-            if entry["files"]:
-                entry["status"] = "downloaded"
-            elif entry["sources"] and not apply:
-                entry["status"] = "available-preview"
-            elif entry["errors"]:
-                entry["status"] = "failed"
-            else:
-                entry["status"] = "none-found"
-            if apply:
-                connection.commit()
-                if not entry["files"]:
-                    queue.append({"citation_key": paper["citation_key"], "doi": paper.get("doi") or "", "title": paper["title"], "kind": "supplement",
-                                  "reason": entry["status"] + ("; " + entry["errors"][-1]["error"] if entry["errors"] else ""),
-                                  "landing_url": f"https://doi.org/{paper['doi']}" if paper.get("doi") else (paper.get("url") or "")})
-            report.append(entry)
+        futures = [pool.submit(_supplement_job, paper, links[paper["id"]], email, apply, publisher_pages, fetch) for paper in rows]
+        jobs = [future.result() for future in as_completed(futures)]
+    if chosen == "aria2":
+        _resolve_deferred(jobs, root, email, max_workers, connections, python_fallback, notes)
+    for job in jobs:
+        paper = by_key[job["citation_key"]]
+        entry = {k: v for k, v in job.items() if k != "items"}
+        entry["errors"] = [{k: v for k, v in e.items() if k != "body"} for e in entry["errors"]]
+        if apply:
+            entry["transport"] = chosen
+        entry["files"] = [store_file(connection, root, paper, "supplement", item["body"], item["url"], item["source"], item["license"],
+                                     item["content_type"], item["name"]) for item in job["items"]]
+        if entry["files"]:
+            entry["status"] = "downloaded"
+        elif entry["sources"] and not apply:
+            entry["status"] = "available-preview"
+        elif entry["errors"]:
+            entry["status"] = "failed"
+        else:
+            entry["status"] = "none-found"
+        if apply:
+            connection.commit()
+            if not entry["files"]:
+                queue.append({"citation_key": paper["citation_key"], "doi": paper.get("doi") or "", "title": paper["title"], "kind": "supplement",
+                              "reason": entry["status"] + ("; " + entry["errors"][-1]["error"] if entry["errors"] else ""),
+                              "landing_url": f"https://doi.org/{paper['doi']}" if paper.get("doi") else (paper.get("url") or "")})
+        report.append(entry)
     if apply and queue:
         write_browser_queue(root, queue)
     return sorted(report, key=lambda e: e["citation_key"])
@@ -707,7 +876,105 @@ def crossref_published(paper: dict[str, Any], email: str | None) -> dict[str, An
     return None
 
 
-def publications(connection: sqlite3.Connection, email: str | None, apply: bool) -> list[dict[str, Any]]:
+PREPRINT_HOSTS = ("arxiv.org", "biorxiv.org", "medrxiv.org", "ssrn.com", "researchsquare.com", "preprints.org", "chemrxiv.org", "osf.io")
+MIN_PUBLISHED_BYTES = int(os.environ.get("CORPUS_ATLAS_MIN_PDF_BYTES", "10000"))
+
+
+def is_preprint_source(url: str, source: str = "", version: str = "") -> bool:
+    host = urllib.parse.urlparse(url or "").netloc.lower()
+    return (version == "submittedVersion" or any(host == h or host.endswith("." + h) for h in PREPRINT_HOSTS)
+            or bool(re.search(r"\b(?:arxiv|biorxiv|medrxiv|preprint)\b", source or "", re.I)))
+
+
+def published_candidate(candidate: dict[str, str]) -> bool:
+    return not is_preprint_source(candidate.get("url", ""), candidate.get("source", ""), candidate.get("version", ""))
+
+
+def pdftotext_path() -> str | None:
+    return shutil.which("pdftotext")
+
+
+def verify_published_pdf(body: bytes, title: str) -> tuple[bool, str]:
+    """paper-lib rule: real PDF, >=10 KB, and (when pdftotext is installed) the first three
+    pages cover >=72% of the title tokens."""
+    if not body.startswith(b"%PDF-"):
+        return False, "payload is not a PDF"
+    if len(body) < MIN_PUBLISHED_BYTES:
+        return False, f"PDF is smaller than {MIN_PUBLISHED_BYTES} bytes"
+    tool = pdftotext_path()
+    if not tool:
+        return True, "pdf magic + size (pdftotext not installed)"
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+        handle.write(body); handle.flush()
+        try:
+            text = subprocess.run([tool, "-f", "1", "-l", "3", handle.name, "-"], capture_output=True, text=True, timeout=60, check=True).stdout
+        except (subprocess.SubprocessError, OSError) as error:
+            return False, f"PDF parser failed: {type(error).__name__}"
+    expected, actual = normalized_title(title), normalized_title(text)
+    tokens = [token for token in expected.split() if len(token) > 2]
+    coverage = sum(token in actual for token in tokens) / max(len(tokens), 1)
+    if expected not in actual and coverage < 0.72:
+        return False, f"title token coverage {coverage:.2f}"
+    return True, f"title token coverage {coverage:.2f}"
+
+
+def _replace_preprint_attachment(connection: sqlite3.Connection, root: Path, paper: dict[str, Any], email: str | None,
+                                 prune: bool) -> dict[str, Any]:
+    """Download the published version (never from a preprint server) and demote or prune
+    the preprint attachment. The record keeps its arXiv ID either way."""
+    files = [dict(r) for r in connection.execute("SELECT * FROM paper_files WHERE paper_id=? AND role IN ('main','preprint')", (paper["id"],))]
+    mains = [f for f in files if f["role"] == "main"]
+    if any(not is_preprint_source(f["source_url"], f["source_name"] or "") for f in mains):
+        return {"status": "published-version-local"}
+    from .library import record_links
+    data = {**paper, "_links": record_links(connection, paper["id"], "pdf")}
+    rejected: list[dict[str, str]] = []
+
+    def accept(candidate: dict[str, str]) -> bool:
+        return published_candidate(candidate)
+
+    outcome = fetch_fulltext(data, email, accept=accept)
+    while outcome["status"] == "downloaded":
+        ok, note = verify_published_pdf(outcome["body"], paper["title"])
+        if ok:
+            break
+        rejected.append({"url": outcome["candidate"]["url"], "source": outcome["candidate"]["source"], "reason": note})
+        bad = {item["url"] for item in rejected}
+        outcome = fetch_fulltext(data, email, accept=lambda c: published_candidate(c) and c["url"] not in bad)
+    if outcome["status"] != "downloaded":
+        return {"status": "published-version-unavailable", "attempts": outcome["attempts"] + rejected}
+    candidate = outcome["candidate"]
+    preprints = [f for f in files if f["role"] == "preprint" or is_preprint_source(f["source_url"], f["source_name"] or "")]
+    digest = hashlib.sha256(outcome["body"]).hexdigest()
+    if any(f["sha256"] == digest for f in preprints):
+        return {"status": "published-version-unavailable", "attempts": [{"url": candidate["url"], "source": candidate["source"],
+                                                                          "reason": "identical to the preprint PDF"}]}
+    for f in preprints:  # demote first so the new file becomes the only main attachment
+        connection.execute("UPDATE OR IGNORE paper_files SET role='preprint' WHERE id=?", (f["id"],))
+    stored = store_file(connection, root, paper, "main", outcome["body"], candidate["url"], candidate["source"],
+                        candidate["license"], outcome["content_type"])
+    pruned = []
+    if prune:
+        for f in connection.execute("SELECT * FROM paper_files WHERE paper_id=? AND role='preprint'", (paper["id"],)).fetchall():
+            path = root / f["local_file"]
+            shared = connection.execute("SELECT COUNT(*) FROM paper_files WHERE local_file=? AND id!=?", (f["local_file"], f["id"])).fetchone()[0]
+            if not shared:
+                path.unlink(missing_ok=True)
+            connection.execute("DELETE FROM paper_files WHERE id=?", (f["id"],))
+            pruned.append(f["local_file"])
+    return {"status": "published-version-downloaded", "file": stored["file"], "source": candidate["source"],
+            "license": candidate["license"], "preprint_files": [f["local_file"] for f in preprints],
+            "preprint_action": ("pruned" if prune else "role=preprint") if preprints else "none", "pruned": pruned}
+
+
+def publications(connection: sqlite3.Connection, email: str | None, apply: bool, root: Path | None = None,
+                 download: bool = True, prune_preprint: bool = False) -> list[dict[str, Any]]:
+    """Find published versions of preprints. ``--apply`` records the published DOI/venue
+    (keeping the arXiv ID), then fetches the published PDF from a non-preprint legal OA
+    location; once verified the preprint attachment becomes role=preprint, or is deleted
+    with ``prune_preprint``."""
     report = []
     for paper in [dict(r) for r in connection.execute("SELECT * FROM papers ORDER BY citation_key")]:
         if not is_preprint(paper):
@@ -724,6 +991,10 @@ def publications(connection: sqlite3.Connection, email: str | None, apply: bool)
                 connection.execute("UPDATE papers SET doi=?, arxiv=COALESCE(arxiv,?), venue=COALESCE(?,venue), updated_at=? WHERE id=?",
                                    (found["doi"], arxiv, found.get("venue"), current_time(), paper["id"]))
                 entry["applied"] = True
+                if download and root is not None:
+                    updated = dict(connection.execute("SELECT * FROM papers WHERE id=?", (paper["id"],)).fetchone())
+                    entry["fulltext"] = _replace_preprint_attachment(connection, root, updated, email, prune_preprint)
+                connection.commit()
         report.append(entry)
     return report
 
