@@ -24,7 +24,7 @@ def fake_web(monkeypatch, routes):
     """routes: url-prefix -> (status, content_type, body) or JSON-serialisable object."""
     seen = []
 
-    def http_get(url, accept="application/json", email=None, timeout=60):
+    def http_get(url, accept="application/json", email=None, timeout=60, attempts=3):
         seen.append({"url": url, "accept": accept})
         for prefix, value in routes.items():
             if url.startswith(prefix):
@@ -86,8 +86,10 @@ def test_infer_extension_office_zip():
 
 
 def test_user_agent_is_descriptive_and_accepts_pdf():
-    assert ft.user_agent("me@example.org").startswith("Mozilla/5.0 (compatible; CorpusAtlas/")
+    assert ft.user_agent("me@example.org").startswith("CorpusAtlas/")
     assert "mailto:me@example.org" in ft.user_agent("me@example.org")
+    download_ua = ft.user_agent("me@example.org", api=False)
+    assert "Mozilla" not in download_ua and "mailto" not in download_ua and "http" not in download_ua
     assert ft.PDF_ACCEPT.startswith("application/pdf")
 
 

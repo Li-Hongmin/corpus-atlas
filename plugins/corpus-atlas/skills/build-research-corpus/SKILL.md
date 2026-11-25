@@ -69,14 +69,19 @@ corpus-atlas paper retrieve-all WORKSPACE --max-workers 4
 corpus-atlas paper resolve WORKSPACE --paper CITATION_KEY      # inspect candidates only
 ```
 
-Candidates are tried in order: OpenAlex best/other OA locations, Unpaywall, Europe PMC/PMC, arXiv,
-bioRxiv/medRxiv. Only a real PDF is accepted; landing pages, logins, and 403s are recorded as
-failures. `retrieve-all` is resumable (local full texts are skipped) and writes
-`reports/retrieve-all-*.json` plus `reports/fulltext-failures.csv`, a queue for manual follow-up in a
-browser through the user's own legitimate access. Files get extensions from magic bytes/content type.
+Candidates are tried lazily in order: record/matrix `open_access_pdf`, OpenAlex OA locations,
+Unpaywall, Europe PMC/PMC, NCBI PMC OA package, arXiv, bioRxiv/medRxiv, BMC/Springer OA. Only a real
+PDF is accepted; landing pages, logins, and 403s are recorded as failures. `retrieve-all` is
+resumable and writes `reports/retrieve-all-*.json`, `reports/fulltext-failures.csv`, and
+`reports/browser-queue.csv`. `paper retrieve --paper KEY` without `--url` auto-resolves one paper.
+
+Import a literature matrix with `paper import-matrix WORKSPACE --from matrix.csv`; the
+`supplement_urls` column takes a semicolon list or a JSON list of `{url, source, license, filename}`.
 
 ```bash
-corpus-atlas paper supplements WORKSPACE [--apply]   # Europe PMC supplementary files; preview default
+corpus-atlas paper supplements WORKSPACE [--apply]   # matrix URLs, Europe PMC ZIP, publisher ESM/mmc/SI pages
+corpus-atlas paper browser-queue WORKSPACE           # items left for the user's own legitimate browser access
+corpus-atlas paper import-browser-results WORKSPACE --from results.csv [--apply]  # needs source+license per file
 corpus-atlas paper publications WORKSPACE [--apply]  # preprint -> published DOI; preview default
 corpus-atlas paper citations WORKSPACE --paper KEY --provider openalex [--cache]
 corpus-atlas paper check WORKSPACE [--restore-from DIR [--apply]]  # sha256 integrity / restore preview
@@ -87,11 +92,13 @@ bypass authentication, CAPTCHA, access controls, or paywalls. Search the local c
 
 ```bash
 corpus-atlas paper search WORKSPACE 'title, author, abstract, or DOI query'
-corpus-atlas paper dedupe WORKSPACE
+corpus-atlas paper dedupe WORKSPACE [--apply]
+corpus-atlas paper normalize WORKSPACE [--apply]     # canonical author+year+keyword keys and file names
 corpus-atlas paper export-bib WORKSPACE --output corpus.bib
 ```
 
-`paper dedupe` is a non-destructive preview. Prefer DOI, arXiv, or PMID identity; use normalized title
+`paper dedupe` previews by default; `--apply` merges into the record with a main PDF/published DOI/most
+fields. Prefer DOI, arXiv, or PMID identity; use normalized title
 and year only as a candidate signal. Read `references/science.md` for the retrieval ladder and
 evidence-level rules.
 
