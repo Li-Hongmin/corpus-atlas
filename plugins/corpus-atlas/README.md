@@ -50,14 +50,43 @@ corpus-atlas paper search investigations/example "distribution shift"
 corpus-atlas paper retrieve investigations/example --paper smith2026causal \
   --url 'https://repository.example/paper.pdf' --source 'Institutional repository' \
   --license 'CC-BY-4.0' --role main
-corpus-atlas paper dedupe investigations/example
-corpus-atlas paper export-bib investigations/example --output corpus.bib
+corpus-atlas paper import-matrix investigations/example --from literature-matrix.csv  # open_access_pdf, supplement_urls
+corpus-atlas paper cache-record investigations/example --from record.json      # JSON or simple YAML
+corpus-atlas paper retrieve investigations/example --paper smith2026causal     # no --url: auto-resolve OA
+corpus-atlas paper retrieve-all investigations/example --email you@example.org --max-workers 8
+corpus-atlas paper supplements investigations/example --apply --max-workers 8
+corpus-atlas paper browser-queue investigations/example                         # manual/browser worklist
+corpus-atlas paper import-browser-results investigations/example --from results.csv [--apply]
+corpus-atlas paper publications investigations/example          # preview; add --apply to update
+corpus-atlas paper citations investigations/example --paper smith2026causal --cache
+corpus-atlas paper check investigations/example --restore-from ~/backup   # preview restore by sha256
+corpus-atlas paper dedupe investigations/example        # preview; --apply merges into the richest record
+corpus-atlas paper normalize investigations/example     # canonical keys/filenames; preview; --apply
+corpus-atlas paper export-bib investigations/example --output corpus.bib [--include-files]
 ```
 
 Paper records retain DOI, arXiv, PMID, Semantic Scholar and OpenAlex identifiers, abstracts,
 backward references, forward citations, reading status, full-text status, and separately recorded
 main-text and supplementary attachments. A paper belongs to the corpus when its record is admitted;
 a PDF is optional.
+
+`retrieve-all` resolves legal open-access copies only (record/matrix `open_access_pdf`, OpenAlex
+locations, Unpaywall when an email is given via `--email` or `CORPUS_ATLAS_EMAIL`, Europe PMC/PMC,
+the NCBI PMC OA package, arXiv, bioRxiv/medRxiv, BMC/Springer OA), queried lazily and batched
+(40 DOIs per OpenAlex request, 50 per Europe PMC request). It accepts only real PDFs and never
+bypasses paywalls, logins, or CAPTCHAs. Requests use the system trust store plus common CA bundle
+paths, retry 429/5xx with backoff (honouring `Retry-After`), and are rate limited per host
+(`CORPUS_ATLAS_HOST_INTERVAL`, default 0.2 s). It is resumable and writes a JSON report,
+`reports/fulltext-failures.csv`, and `reports/browser-queue.csv`.
+
+`supplements` takes matrix `supplement_urls` (semicolon list or JSON), the Europe PMC supplementary
+ZIP (true supplement members only; article figure renders are skipped), and publisher-page rules
+(Springer Nature/BMC ESM, Elsevier `mmc`, ACS/Wiley/PLOS/Frontiers/MDPI/RSC SI links). HTML pages
+are rejected. Unresolved items go to the browser queue; files fetched by hand are ingested with
+`import-browser-results` (columns `citation_key,kind,file,url,source,license`), which requires a
+source and license for every file. Attachments
+are named with an extension inferred from magic bytes or content type and recorded with source,
+license, and sha256. Discovery providers: `openalex`, `crossref`, `semanticscholar`.
 
 ## Codex plugin
 
